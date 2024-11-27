@@ -1,0 +1,40 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    env_file:
+      - .env
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+      - ./init-db.sh:/init-db.sh
+    ports:
+      - '5432'
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./app:/app
+    depends_on:
+      - db
+    env_file:
+      - .env
+    tmpfs:
+      - /tmp:size=100G
+
+  langfuse:
+    image: ghcr.io/langfuse/langfuse:latest
+    depends_on:
+      - db
+    ports:
+      - '3000'
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://langfuse:langfuse@db:5432/langfuse
+      - NEXTAUTH_SECRET=mysecret
+      - SALT=mysalt
+      - HOSTNAME=0.0.0.0
+      - NEXTAUTH_URL=http:langfuse.news-caster.orb.local
+      - TELEMETRY_ENABLED=${TELEMETRY_ENABLED:-true}
+      - NEXT_PUBLIC_SIGN_UP_DISABLED=${NEXT_PUBLIC_SIGN_UP_DISABLED:-false}
+      - LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES=${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}

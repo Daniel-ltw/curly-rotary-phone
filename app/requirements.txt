@@ -1,0 +1,10 @@
+pgvector~=0.2.5
+psycopg[binary]~=3.2.3
+python-dotenv
+newspaper3k
+lxml[html_clean]
+playwright
+ell-ai[groq,studio,sqlite]
+peewee
+openai
+tenacity
