@@ -1,69 +1,117 @@
 import asyncio
-import datetime
+from datetime import date, timedelta, datetime
 import os
-import re
+import random
+from time import sleep
 import traceback
-from openai import OpenAI, RateLimitError
+from openai import Client, RateLimitError
 from os import getenv
-from tenacity import retry, stop_after_attempt
-from peewee import IntegrityError
 import ell
 import json
+from itertools import islice
 
 from dotenv import load_dotenv
 load_dotenv()
 
+from tools.news_scrapper import load_one_news, load_nzherald_news, load_google_news
+from tools.news import News, NewsSummary, NewsGroup
+from tools.retry import with_retry
+from tools.news_grouper import KeywordBasedNewsGrouper
 
-# gets API Key from environment variable OPENAI_API_KEY
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=getenv("GROQ_API_KEY"),
-)
+groq_model = "llama-3.1-8b-instant"
+ell.models.groq.register(api_key=getenv("GROQ_API_KEY"))
 
-ell.init(store='./logdir', autocommit=True, verbose=False, default_client=client, autocommit_model="llama-3.1-8b-instant")
+model = "mlx-community/Josiefied-Qwen2.5-7B-Instruct-abliterated-v2-4-bit"
+client = Client(api_key="not-needed", base_url="http://localhost:8080/v1")
 
-from tools.news_scrapper import load_google_news, load_stuff_news, load_nzherald_news, load_one_news
-
-from tools.news import News, NewsSummary
+ell.init(store='./logdir', autocommit=True, verbose=False, autocommit_model=groq_model)
 
 News.create_table()
 NewsSummary.create_table()
+NewsGroup.create_table()
 
+tools = [load_one_news, load_nzherald_news, load_google_news]
 
-def parse_retry_time(exception):
-    if "rate_limit_exceeded" in str(exception):
-        match = re.search(r"Please try again in (\d+)m(\d+\.\d+)s", str(exception))
-        if match:
-            minutes = float(match.group(1))
-            seconds = float(match.group(2)) + 1
-            return minutes * 60 + seconds
-        else:
-            print(str(exception))
-    return 60
-
-def wait_strategy(retry_state):
-    exception = retry_state.outcome.exception()
-    wait_time = parse_retry_time(exception)
-    return wait_time
-
-
-# tools = [load_stuff_news, load_google_news, load_nzherald_news, load_one_news]
-# tools = [load_google_news, load_nzherald_news]
-tools = [load_one_news, load_nzherald_news]
-
-@retry(stop=stop_after_attempt(8), wait=wait_strategy)
-@ell.complex(model="llama-3.1-8b-instant", client=client, tools=tools, temperature=0.1)
+@with_retry
+@ell.complex(model=groq_model, tools=tools, temperature=0.1)
 def initiate_daily():
     """You are a helpful assistant that has tools to get news from different sources."""
-    # return "get all news from nzherald and google"
-    return "get all news from one news and nzherald"
+    return "get all news from one news, nzherald and google news"
 
-@retry(stop=stop_after_attempt(8), wait=wait_strategy)
-@ell.simple(model="llama-3.1-8b-instant", client=client, temperature=0.9)
+@with_retry
+@ell.simple(model=groq_model, temperature=0.1)
+def pick_interesting_news_groups(groups: list[dict]) -> str:
+    """You are an experienced journalist that picks out the most interesting news groups."""
+    return f"""
+    From the following list of news groups from the last 3 days, pick out THE MOST interesting and important news groups.
+    Each group contains related articles about the same topic or event.
+
+    STRICT REQUIREMENT: Select MAXIMUM 2 groups total.
+
+    Selection criteria:
+    1. Most impactful or significant to society
+    2. Breaking news or major developments
+    3. Stories that people should know about
+    4. Diverse topics (don't pick multiple groups about the same general topic)
+    5. Prioritize more recent news (within the last 3 days)
+
+    Chain of thought process:
+    1. First, eliminate any groups older than 3 days
+    2. Then, identify the top 3 most impactful stories based on societal significance
+    3. From these, identify which are truly breaking news or major developments
+    4. Consider which stories the public needs to know about most urgently
+    5. If multiple stories are about the same topic, select only the most comprehensive one
+    6. Finally, select THE MOST important 1-2 stories that meet these criteria
+
+    The groups are formatted as [{{
+        "title": "title of the group",
+        "article_count": number of articles,
+        "keywords": ["keyword1", "keyword2"],
+        "date": "YYYY-MM-DD"
+    }}, ...].
+
+    <news_groups>
+    {json.dumps(groups, indent=2)[:18000]}
+    </news_groups>
+
+    Return ONLY the titles of the 1-2 most important groups in a JSON array format: ["title1", "title2"]
+    We only want the json array and nothing else.
+    You MUST return 1 or 2 groups maximum - no exceptions.
+    """
+
+def process_groups_in_batches(group_info: list[dict], batch_size: int = 5) -> list[str]:
+    """Process groups in batches to avoid token limits."""
+    interesting_groups = set()
+    total_batches = (len(group_info) + batch_size - 1) // batch_size
+
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        batch = list(islice(group_info, start_idx, start_idx + batch_size))
+
+        try:
+            print(f"\nProcessing batch {batch_num + 1}/{total_batches} ({len(batch)} groups)")
+            selected_groups = json.loads(pick_interesting_news_groups(batch))
+            interesting_groups.update(selected_groups)
+            print(f"Selected {len(selected_groups)} groups from this batch")
+
+            # Add a small delay between batches
+            if batch_num < total_batches - 1:
+                asyncio.run(asyncio.sleep(2))
+
+        except Exception as e:
+            print(f"Error processing batch {batch_num + 1}: {str(e)}")
+            print(traceback.format_exc())
+            # If there's an error, include all groups from this batch
+            interesting_groups.update(g["title"] for g in batch)
+
+    return list(interesting_groups)
+
+@with_retry
+@ell.simple(client=client, model=model, temperature=0.9)
 def summarise_news(news: dict):
     """You are a experienced journalist that summarises news articles into points."""
     return f"""
-    From the following given list of news, summarize them into points, make sure to format it as markdown.
+    From the following given news, summarize it into points, make sure to format it as markdown.
     The lists of news are formatted as {{ "title": "content" }}.
 
     Just return the summary in the following format:
@@ -77,102 +125,125 @@ def summarise_news(news: dict):
     </news>
     """
 
-@retry(stop=stop_after_attempt(8), wait=wait_strategy)
-@ell.simple(model="llama-3.1-8b-instant", client=client, temperature=0.1)
-def pick_interesting_news(news: list[str]):
-    """You are a experienced journalist that picks out the most interesting news."""
-    return f"""
-    From the following given list of news, pick out the most interesting news and return the title of the news.
-    The lists of news are formatted as [{{ "title": "summary" }}, {{ "title": "summary" }}].
+def get_list_of_summarised_news(grouped_news: dict):
+    for keywords, news_ids in grouped_news.items():
+        news = News.select().where(News.id.in_(news_ids))
+        main_title = min(news, key=lambda x: len(x.title)).title
+        content = "\n\n".join([n.content for n in news])
 
-    <news>
-    {json.dumps(news, indent=2)[:20000]}
-    </news>
-
-    Just return the title of the news in the following format: "title"
-    """
-
-async def get_list_of_interesting_news() -> list[str]:
-    final_news = []
-    prepared_news = []
-    news = News.select().order_by(News.id.desc())
-    # Select the top 10 news?
-    for index, n in enumerate(news):
-        if index != 0 and index % 8 == 0:
-            await asyncio.sleep(20)
-            try:
-                result = pick_interesting_news(prepared_news)
-            except RateLimitError as e:
-                wait_time = parse_retry_time(e)
-                print(f"Rate limit exceeded, waiting for {wait_time} seconds")
-                await asyncio.sleep(wait_time)
-                result = pick_interesting_news(prepared_news)
-            except Exception as e:
-                print(e)
-                print(traceback.format_exc())
-                continue
-            try:
-                final_news.append(json.loads(result))
-            except json.decoder.JSONDecodeError:
-                result = result.replace('"', "")
-                final_news.append(result)
-            prepared_news = []
-        prepared_news.append(n.llm_summary_format())
-    return final_news
-
-async def get_list_of_summarised_news(final_news: list[str]):
-    news = News.select().where(News.title.in_(final_news))
-    for n in news:
         try:
-            result = summarise_news(n.llm_content_format())
+            result = summarise_news({main_title: content})
+            print(f"Summarised {main_title}")
         except RateLimitError as e:
-            wait_time = parse_retry_time(e)
-            print(f"Rate limit exceeded, waiting for {wait_time} seconds")
-            await asyncio.sleep(wait_time)
-            result = summarise_news(n.llm_content_format())
+            print(f"Rate limit error: {str(e)}")
+            raise  # Re-raise to trigger retry
         except Exception as e:
-            print(e)
+            print(f"Error summarizing news: {str(e)}")
             print(traceback.format_exc())
             continue
 
         result = result.replace('"', "")
         try:
-            summary = NewsSummary.create(title=n.title, summary=result)
-            summary.save()
-        except IntegrityError:
-            pass
+            NewsSummary.replace(title=main_title, summary=result, keywords=keywords).execute()
+        except Exception as e:
+            print(f"Error saving summary: {str(e)}")
+            print(traceback.format_exc())
 
+def wait_random_time():
+    current_time = datetime.now()
+    wait_till = current_time + timedelta(hours=2) + timedelta(seconds=random.uniform(0.1, 60)) # Add a random amount of time between 0.1 and 1 minute
+    counter = 0
+    while datetime.now() < wait_till:
+        if counter % 50 == 0: # every 5 seconds
+            print(".", end="")
+        if counter % 6000 == 0: # every 10 minutes
+            print()
+            print(f"Another {wait_till - datetime.now()} before initiating daily news")
+        sleep(0.1)
+        counter += 1
+    print()
 
 def main():
-    result = initiate_daily()
-    print(result.text)
-    if result.tool_calls:
-        # This is done so that we can pass the tool calls to the language model
-        result_message = result.call_tools_and_collect_as_message(parallel=True, max_workers=3)
-        print("Message to be sent to the LLM:", result_message.text) # Representation of the message to be sent to the LLM.
+    while True:
+        today = date.today()
+        result = initiate_daily()
+        print(result.text)
+        if result.tool_calls:
+            # This is done so that we can pass the tool calls to the language model
+            result_message = result.call_tools_and_collect_as_message(parallel=True, max_workers=3)
+            print("Message to be sent to the LLM:", result_message.text)
 
-        final_news = asyncio.run(get_list_of_interesting_news())
-        asyncio.run(get_list_of_summarised_news(final_news))
+            # Use the new NewsGrouper to process articles
+            grouper = KeywordBasedNewsGrouper()
+            total_processed = grouper.group_all_ungrouped()
+            print(f"Processed {total_processed} articles into groups")
 
+            # Get all groups created
+            groups = (News.select(News.group)
+                     .where(News.group.is_null(False))
+                     .where(News.date >= today - timedelta(days=3))
+                     .group_by(News.group))
 
-        summarised_news = NewsSummary.select()
-        filename = f"./output/{datetime.date.today().strftime('%Y-%m-%d')}.md"
-        if os.path.exists(filename):
-            os.remove(filename)
+            # Prepare groups for interesting news selection
+            group_info = []
+            grouped_news = {}
 
-        if not os.path.exists("./output"):
-            os.makedirs("./output")
+            for group in groups:
+                news_in_group = News.select().where(News.group == group.group)
+                news_count = len(list(news_in_group))
+                # Parse keywords from string to list
+                try:
+                    keywords = json.loads(group.group.keywords)
+                except json.JSONDecodeError:
+                    keywords = group.group.keywords.split(", ")
 
-        with open(filename, "w") as f:
-            f.write("# Today's News\n\n")
-            for sn in summarised_news:
-                f.write(f"### {sn.title}\n")
-                f.write(sn.summary)
-                f.write("\n-----\n\n")
+                group_info.append({
+                    "title": group.group.title,
+                    "article_count": news_count,
+                    "keywords": keywords,
+                    "date": group.group.date.isoformat()  # Add date for reference
+                })
+                grouped_news[group.group.title] = {
+                    "ids": [n.id for n in news_in_group],
+                    "keywords": group.group.keywords,
+                    "date": group.group.date.isoformat()
+                }
+
+            print(f"Found {len(group_info)} groups from the last 3 days")
+
+        #     # Process groups in batches and get interesting ones
+        #     interesting_groups = process_groups_in_batches(group_info)
+        #     print(f"Selected {len(interesting_groups)} interesting groups in total")
+
+        #     # Filter for interesting groups only
+        #     interesting_grouped_news = {}
+        #     for title in interesting_groups:
+        #         if title in grouped_news:
+        #             interesting_grouped_news[grouped_news[title]["keywords"]] = grouped_news[title]["ids"]
+
+        #     print(f"Grouped news to summarize: {json.dumps(interesting_grouped_news, indent=2)}")
+
+        #     # Summarize the grouped news
+        #     NewsSummary.delete().execute()
+        #     get_list_of_summarised_news(interesting_grouped_news)
+
+        #     # Write summaries to file
+        #     summarised_news = NewsSummary.select().where(NewsSummary.date == today)
+        #     filename = f"./output/{today.strftime('%Y-%m-%d')}.md"
+        #     if os.path.exists(filename):
+        #         os.remove(filename)
+
+        #     if not os.path.exists("./output"):
+        #         os.makedirs("./output")
+
+        #     print(f"Writing to {filename}")
+        #     with open(filename, "w") as f:
+        #         f.write("# Today's News\n\n")
+        #         for sn in summarised_news:
+        #             f.write(f"### {sn.title}\n")
+        #             f.write(sn.summary)
+        #             f.write("\n-----\n\n")
+        wait_random_time()
 
 if __name__ == "__main__":
     main()
-
-
-# TODO:
-# - Need to be able to group news by 2-3 matching keywords

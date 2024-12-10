@@ -10,10 +10,38 @@ import ell
 import nltk
 from tenacity import retry, stop_after_attempt, wait_exponential
 nltk.download('punkt')
+from sklearn.feature_extraction.text import TfidfVectorizer
+from nltk.corpus import stopwords
+from nltk.tokenize import sent_tokenize
+from nltk.tokenize import word_tokenize
+import numpy as np
 
 from .news import News
 
 # Store and load articles/links into a sqlite db
+
+TOPIC_KEYWORDS = {
+    'road_trip': {
+        'primary': ['road trip'],
+        'related': ['journey', 'travel', 'destination']
+    },
+    'fire_emergency': {
+        'primary': ['fire', 'fenz'],
+        'related': ['emergency', 'crews', 'evacuate']
+    },
+    'syria_conflict': {
+        'primary': ['syria', 'assad'],
+        'related': ['rebel', 'regime', 'damascus']
+    },
+    'formula1': {
+        'primary': ['f1', 'grand prix'],
+        'related': ['racing', 'driver']
+    },
+    'youth_programs': {
+        'primary': ['boot camp'],
+        'related': ['youth', 'teenager']
+    }
+}
 
 @ell.tool()
 def load_google_news():
@@ -34,13 +62,18 @@ def load_google_news():
                 link = link[0]
             if link.has_attr('href') and link['href'].startswith('./read') and link.text != '' and 'quiz' not in link.text:
                 link['href'] = f"https://news.google.com{link['href'].replace('./', '/')}"
-                page = browser.new_page()
-                page.goto(link['href'], wait_until='domcontentloaded')
 
-                index = 0
-                while page.url.startswith('https://news.google.com') and index < 3:
-                    page.wait_for_load_state('networkidle')
-                    index = index + 1
+                try:
+                    page = browser.new_page()
+                    page.goto(link['href'], wait_until='domcontentloaded')
+
+                    index = 0
+                    while page.url.startswith('https://news.google.com') and index < 3:
+                        page.wait_for_load_state('networkidle')
+                        index = index + 1
+                except Exception as e:
+                    print(f"Error loading page: {e}")
+                    continue
 
                 # ignore pages that do not load
                 if page.url.startswith('https://news.google.com'):
@@ -49,8 +82,10 @@ def load_google_news():
                 if len(page.title()) < 2:
                     continue
 
+                if page.title().startswith('Watch:'):
+                    continue
+
                 url = page.url
-                print(page.content())
                 page.close()
 
                 try:
@@ -60,6 +95,7 @@ def load_google_news():
                     continue
 
         browser.close()
+        return "Successfully loaded google news"
 
 @ell.tool()
 def load_stuff_news():
@@ -87,7 +123,7 @@ def load_one_news():
             if link.has_attr('href'):
                 title = (link.find('h2') or link.find('h3')).text
                 # ignore Quiz, activities and classified
-                if 'Quiz' in title:
+                if 'Quiz' in title or 'Full video' in title or title.startswith(r' ?Watch:'):
                     continue
 
                 try:
@@ -98,6 +134,9 @@ def load_one_news():
                     insert_news(news, "1news")
                 except Exception as e:
                     continue
+
+        browser.close()
+        return "Successfully loaded 1news news"
 
 @ell.tool()
 def load_nzherald_news():
@@ -131,7 +170,7 @@ def load_nzherald_news():
             title = (link.find('h2') or link.find('h3')).text
 
             # ignore quiz, activities and classified
-            if 'quiz' in title or 'Sudoku' in title or 'Crosswords' in title or 'classified ad' in title or title == 'Public Notices' or title == 'Death Notices':
+            if 'quiz' in title or 'Sudoku' in title or 'Crosswords' in title or 'classified ad' in title or title == 'Public Notices' or title == 'Death Notices' or 'Herald Premium' in title or 'NZ Herald Live' in title or title.startswith(r' ?Watch:'):
                 # print('ignore activities or classified: ', title)
                 continue
 
@@ -144,11 +183,89 @@ def load_nzherald_news():
             breakpoint()
             print('')
 
-# @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1.8, min=60, max=600))
 def build_news_article(url: str) -> Article:
     try:
         news = Article(url)
-        news.build()
+        news.download()
+        news.parse()
+
+        # Get text and handle empty content
+        text = news.text
+        if not text:
+            return news
+
+        # Create TF-IDF vectorizer for keyword extraction
+        vectorizer = TfidfVectorizer(
+            stop_words='english',
+            max_features=10,
+            ngram_range=(1, 2)
+        )
+
+        # Extract keywords using both TF-IDF and newspaper's implementation
+        news.nlp()  # This runs newspaper's implementation
+        tfidf_matrix = vectorizer.fit_transform([text])
+        feature_names = vectorizer.get_feature_names_out()
+        tfidf_scores = tfidf_matrix.toarray()[0]
+
+        # Get TF-IDF keywords
+        tfidf_keywords = [feature_names[i] for i in tfidf_scores.argsort()[-5:][::-1]]
+
+        # Check for topic keywords in title and content
+        title_and_text = f"{news.title.lower()} {text.lower()}"
+        topic_keywords = []
+        matched_topics = []
+
+        for topic, keywords in TOPIC_KEYWORDS.items():
+            # Check for primary keywords (strong indicators)
+            primary_matches = sum(1 for k in keywords['primary']
+                                if k in title_and_text)
+            # Check for related keywords
+            related_matches = sum(1 for k in keywords['related']
+                                if k in title_and_text)
+
+            # Add topic if we have strong matches
+            if primary_matches > 0 or related_matches >= 2:
+                topic_keywords.extend(keywords['primary'] + keywords['related'])
+                matched_topics.append(topic)
+
+        # Add matched topics to keywords with weights
+        all_keywords = list(set(
+            news.keywords[:5] +  # Original newspaper keywords
+            tfidf_keywords +     # TF-IDF keywords
+            topic_keywords       # Topic-specific keywords
+        ))
+
+        news.keywords = all_keywords
+
+        # Enhanced summarization
+        sentences = sent_tokenize(text)
+
+        if len(sentences) > 3:
+            # Score sentences based on keyword presence and position
+            sent_scores = []
+            for i, sentence in enumerate(sentences):
+                # Position score - earlier sentences get higher weight
+                position_score = 1.0 / (i + 1)
+
+                # Keyword score - now using our enhanced keywords
+                keyword_score = sum(1 for keyword in news.keywords
+                                  if keyword.lower() in sentence.lower())
+
+                # Topic relevance score
+                topic_score = sum(1 for keyword in topic_keywords
+                                if keyword in sentence.lower())
+
+                # Combined score with topic relevance
+                total_score = (keyword_score * 0.5) + (position_score * 0.3) + (topic_score * 0.2)
+                sent_scores.append((sentence, total_score))
+
+            # Get top 3 sentences
+            sent_scores.sort(key=lambda x: x[1], reverse=True)
+            enhanced_summary = ' '.join(sent[0] for sent in sent_scores[:3])
+
+            # Always use enhanced summary
+            news.summary = enhanced_summary
+
         return news
     except Exception as e:
         raise e

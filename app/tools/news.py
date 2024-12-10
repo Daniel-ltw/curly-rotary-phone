@@ -1,11 +1,22 @@
 from datetime import date
-from peewee import Model, TextField, IntegerField, DateField, SqliteDatabase, SQL
+import json
+from peewee import Model, TextField, IntegerField, DateField, SqliteDatabase, SQL, ForeignKeyField
 
-db = SqliteDatabase(f"db-{date.today()}.sqlite")
+db = SqliteDatabase("news-db.sqlite")
 
 class BaseModel(Model):
     class Meta:
         database = db
+
+class NewsGroup(BaseModel):
+    id = IntegerField(primary_key=True)
+    date = DateField(default=date.today())
+    title = TextField()
+    summary = TextField()
+    keywords = TextField()
+
+    class Meta:
+        db_table = 'news_groups'
 
 class News(BaseModel):
     id = IntegerField(primary_key=True)
@@ -16,6 +27,7 @@ class News(BaseModel):
     content = TextField()
     summary = TextField()
     source = TextField()
+    group = ForeignKeyField(NewsGroup, backref='articles', null=True)
 
     class Meta:
         db_table = 'news'
@@ -25,16 +37,20 @@ class News(BaseModel):
         ]
 
     def llm_summary_format(self):
-        return {self.title: self.summary.replace('ADVERTISEMENT', '').replace('\n\n', '\n')} # :::{json.loads(self.keywords.decode())}
+        return {self.title: self.summary.replace('ADVERTISEMENT', '').replace('\n\n', '\n')}
 
     def llm_content_format(self):
-        return {self.title: self.content.replace('ADVERTISEMENT', '').replace('\n\n', '\n')} # :::{json.loads(self.keywords.decode())}
+        return {self.title: self.content.replace('ADVERTISEMENT', '').replace('\n\n', '\n')}
+
+    def llm_keywords_format(self):
+        return {self.id: ", ".join(json.loads(self.keywords))}
 
 class NewsSummary(BaseModel):
     id = IntegerField(primary_key=True)
     date = DateField(default=date.today())
     title = TextField()
     summary = TextField()
+    keywords = TextField()
 
     class Meta:
         db_table = 'summaries'
