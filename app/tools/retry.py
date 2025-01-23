@@ -18,6 +18,7 @@ def parse_retry_time(exception):
 def wait_strategy(retry_state):
     """Custom wait strategy for retrying failed requests."""
     exception = retry_state.outcome.exception()
+    print(f"Exception: {str(exception)}")
     wait_time = parse_retry_time(exception)
     return wait_time
 

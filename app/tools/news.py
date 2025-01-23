@@ -1,6 +1,6 @@
 from datetime import date
 import json
-from peewee import Model, TextField, IntegerField, DateField, SqliteDatabase, SQL, ForeignKeyField
+from peewee import Model, BooleanField, TextField, IntegerField, DateField, SqliteDatabase, SQL, ForeignKeyField
 
 db = SqliteDatabase("news-db.sqlite")
 
@@ -28,6 +28,7 @@ class News(BaseModel):
     summary = TextField()
     source = TextField()
     group = ForeignKeyField(NewsGroup, backref='articles', null=True)
+    processed = BooleanField(default=False)
 
     class Meta:
         db_table = 'news'

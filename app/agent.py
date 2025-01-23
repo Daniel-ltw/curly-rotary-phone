@@ -9,22 +9,22 @@ from os import getenv
 import ell
 import json
 from itertools import islice
+from groq import Groq
 
 from dotenv import load_dotenv
 load_dotenv()
 
+from tools.news_processor import NewsProcessor
 from tools.news_scrapper import load_one_news, load_nzherald_news, load_google_news
 from tools.news import News, NewsSummary, NewsGroup
 from tools.retry import with_retry
 from tools.news_grouper import KeywordBasedNewsGrouper
 
+ell.init(store='./logdir', autocommit=True, verbose=False)
+
 groq_model = "llama-3.1-8b-instant"
-ell.models.groq.register(api_key=getenv("GROQ_API_KEY"))
+groq_client = Groq(api_key=getenv("GROQ_API_KEY"))
 
-model = "mlx-community/Josiefied-Qwen2.5-7B-Instruct-abliterated-v2-4-bit"
-client = Client(api_key="not-needed", base_url="http://localhost:8080/v1")
-
-ell.init(store='./logdir', autocommit=True, verbose=False, autocommit_model=groq_model)
 
 News.create_table()
 NewsSummary.create_table()
@@ -33,13 +33,13 @@ NewsGroup.create_table()
 tools = [load_one_news, load_nzherald_news, load_google_news]
 
 @with_retry
-@ell.complex(model=groq_model, tools=tools, temperature=0.1)
+@ell.complex(model=groq_model, tools=tools, temperature=0.1, client=groq_client)
 def initiate_daily():
     """You are a helpful assistant that has tools to get news from different sources."""
-    return "get all news from one news, nzherald and google news"
+    return "get all news from one news and nzherald"
 
 @with_retry
-@ell.simple(model=groq_model, temperature=0.1)
+@ell.simple(model=groq_model, temperature=0.1, client=groq_client)
 def pick_interesting_news_groups(groups: list[dict]) -> str:
     """You are an experienced journalist that picks out the most interesting news groups."""
     return f"""
@@ -56,12 +56,10 @@ def pick_interesting_news_groups(groups: list[dict]) -> str:
     5. Prioritize more recent news (within the last 3 days)
 
     Chain of thought process:
-    1. First, eliminate any groups older than 3 days
-    2. Then, identify the top 3 most impactful stories based on societal significance
-    3. From these, identify which are truly breaking news or major developments
-    4. Consider which stories the public needs to know about most urgently
-    5. If multiple stories are about the same topic, select only the most comprehensive one
-    6. Finally, select THE MOST important 1-2 stories that meet these criteria
+    1. Identify the most impactful stories based on selection criteria
+    2. From these, identify which are truly breaking news or major developments
+    3. Consider which stories the public needs to know about most urgently
+    4. Finally, select THE MOST important 1-2 stories that meet these criteria
 
     The groups are formatted as [{{
         "title": "title of the group",
@@ -107,7 +105,7 @@ def process_groups_in_batches(group_info: list[dict], batch_size: int = 5) -> li
     return list(interesting_groups)
 
 @with_retry
-@ell.simple(client=client, model=model, temperature=0.9)
+@ell.simple(client=groq_client, model=groq_model, temperature=0.9)
 def summarise_news(news: dict):
     """You are a experienced journalist that summarises news articles into points."""
     return f"""
@@ -120,9 +118,8 @@ def summarise_news(news: dict):
     * Point 3
     ...
 
-    <news>
+    --- news ---
     {json.dumps(news, indent=2)[:20000]}
-    </news>
     """
 
 def get_list_of_summarised_news(grouped_news: dict):
@@ -151,10 +148,11 @@ def get_list_of_summarised_news(grouped_news: dict):
 
 def wait_random_time():
     current_time = datetime.now()
-    wait_till = current_time + timedelta(hours=2) + timedelta(seconds=random.uniform(0.1, 60)) # Add a random amount of time between 0.1 and 1 minute
+    print(f"Current time: {current_time}")
+    wait_till = current_time + timedelta(hours=1.8) + timedelta(seconds=random.uniform(0.1, 60)) # Add a random amount of time between 0.1 and 1 minute
     counter = 0
     while datetime.now() < wait_till:
-        if counter % 50 == 0: # every 5 seconds
+        if counter % 50 == 0 and counter != 0: # every 5 seconds
             print(".", end="")
         if counter % 6000 == 0: # every 10 minutes
             print()
@@ -167,11 +165,12 @@ def main():
     while True:
         today = date.today()
         result = initiate_daily()
-        print(result.text)
         if result.tool_calls:
             # This is done so that we can pass the tool calls to the language model
             result_message = result.call_tools_and_collect_as_message(parallel=True, max_workers=3)
-            print("Message to be sent to the LLM:", result_message.text)
+            print("Message to be sent to the LLM:\n", result_message.text)
+
+            NewsProcessor.process_all_unprocessed()
 
             # Use the new NewsGrouper to process articles
             grouper = KeywordBasedNewsGrouper()
@@ -179,70 +178,71 @@ def main():
             print(f"Processed {total_processed} articles into groups")
 
             # Get all groups created
-            groups = (News.select(News.group)
-                     .where(News.group.is_null(False))
-                     .where(News.date >= today - timedelta(days=3))
-                     .group_by(News.group))
+            groups = NewsGroup.select().where(NewsGroup.date >= today - timedelta(days=3))
+            print(f"Found {len(groups)} groups from the last 3 days")
+
+            defined_groups = [group for group in groups if group.articles.count() > 1]
+            print(f"Found {len(defined_groups)} defined groups from the last 3 days")
 
             # Prepare groups for interesting news selection
             group_info = []
             grouped_news = {}
 
-            for group in groups:
-                news_in_group = News.select().where(News.group == group.group)
+            for group in defined_groups:
+                news_in_group = News.select().where(News.group == group)
                 news_count = len(list(news_in_group))
                 # Parse keywords from string to list
                 try:
-                    keywords = json.loads(group.group.keywords)
+                    keywords = json.loads(group.keywords)
                 except json.JSONDecodeError:
-                    keywords = group.group.keywords.split(", ")
+                    keywords = group.keywords.split(", ")
 
                 group_info.append({
-                    "title": group.group.title,
+                    "title": group.title,
                     "article_count": news_count,
                     "keywords": keywords,
-                    "date": group.group.date.isoformat()  # Add date for reference
+                    "date": group.date.isoformat()  # Add date for reference
                 })
-                grouped_news[group.group.title] = {
+                grouped_news[group.title] = {
                     "ids": [n.id for n in news_in_group],
-                    "keywords": group.group.keywords,
-                    "date": group.group.date.isoformat()
+                    "keywords": group.keywords,
+                    "date": group.date.isoformat()
                 }
 
             print(f"Found {len(group_info)} groups from the last 3 days")
 
-        #     # Process groups in batches and get interesting ones
-        #     interesting_groups = process_groups_in_batches(group_info)
-        #     print(f"Selected {len(interesting_groups)} interesting groups in total")
+            # Process groups in batches and get interesting ones
+            interesting_groups = process_groups_in_batches(group_info)
+            print(f"Selected {len(interesting_groups)} interesting groups in total")
 
-        #     # Filter for interesting groups only
-        #     interesting_grouped_news = {}
-        #     for title in interesting_groups:
-        #         if title in grouped_news:
-        #             interesting_grouped_news[grouped_news[title]["keywords"]] = grouped_news[title]["ids"]
+            # Filter for interesting groups only
+            interesting_grouped_news = {}
+            for title in interesting_groups:
+                if title in grouped_news:
+                    interesting_grouped_news[grouped_news[title]["keywords"]] = grouped_news[title]["ids"]
 
-        #     print(f"Grouped news to summarize: {json.dumps(interesting_grouped_news, indent=2)}")
+            print(f"Grouped news to summarize: {json.dumps(interesting_grouped_news, indent=2)}")
 
-        #     # Summarize the grouped news
-        #     NewsSummary.delete().execute()
-        #     get_list_of_summarised_news(interesting_grouped_news)
+            # Summarize the grouped news
+            NewsSummary.delete().execute()
+            get_list_of_summarised_news(interesting_grouped_news)
 
-        #     # Write summaries to file
-        #     summarised_news = NewsSummary.select().where(NewsSummary.date == today)
-        #     filename = f"./output/{today.strftime('%Y-%m-%d')}.md"
-        #     if os.path.exists(filename):
-        #         os.remove(filename)
+            # Write summaries to file
+            summarised_news = NewsSummary.select().where(NewsSummary.date == today)
+            filename = f"./output/{today.strftime('%Y-%m-%d')}.md"
+            if os.path.exists(filename):
+                os.remove(filename)
 
-        #     if not os.path.exists("./output"):
-        #         os.makedirs("./output")
+            if not os.path.exists("./output"):
+                os.makedirs("./output")
 
-        #     print(f"Writing to {filename}")
-        #     with open(filename, "w") as f:
-        #         f.write("# Today's News\n\n")
-        #         for sn in summarised_news:
-        #             f.write(f"### {sn.title}\n")
-        #             f.write(sn.summary)
-        #             f.write("\n-----\n\n")
+            print(f"Writing to {filename}")
+            with open(filename, "w") as f:
+                f.write("# Today's News - " + today.strftime('%A, %d %B %Y') + " - Last updated: " + datetime.now().strftime('%H:%M %Z') + "\n\n")
+                for sn in summarised_news:
+                    f.write(f"### {sn.title}\n")
+                    f.write(sn.summary)
+                    f.write("\n-----\n\n")
         wait_random_time()
 
 if __name__ == "__main__":
