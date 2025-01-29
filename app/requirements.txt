@@ -19,7 +19,7 @@ ell-ai[studio,sqlite]~=0.0.15
 tenacity
 
 # Text to Speech
-kokoro-onnx
+outetts
 soundfile
 
 # AI
