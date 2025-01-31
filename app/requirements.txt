@@ -15,11 +15,11 @@ numpy>=1.22.0
 
 # Utils
 python-dotenv
-ell-ai[studio,sqlite]~=0.0.15
+ell-ai[studio,sqlite]>=0.0.15
 tenacity
 
 # Text to Speech
-kokoro-onnx
+kokoro>=0.3.1
 soundfile
 
 # AI
