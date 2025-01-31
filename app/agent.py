@@ -228,7 +228,7 @@ def main():
             get_list_of_summarised_news(interesting_grouped_news)
 
             # Write summaries to file
-            summarised_news = NewsSummary.select().where(NewsSummary.date == today)
+            summarised_news = NewsSummary.select()
             filename = f"./output/{today.strftime('%Y-%m-%d')}.md"
             if os.path.exists(filename):
                 os.remove(filename)
